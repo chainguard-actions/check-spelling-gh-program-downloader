@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+set -e
+releases=$(mktemp)
+
+setup() {
+  if [ -n "$trace" ]; then
+    set -x
+  fi
+  b='`'
+  headers_file=$(mktemp)
+  last_curl_command=$(mktemp)
+}
+
+curl_handle_error() {
+  curl_error=$(mktemp)
+  if curl -D "$headers_file" -H "$AUTHORIZATION_HEADER" -q -L "$1" -o "$2" 2> "$curl_error"; then
+    echo "curl -D '$headers_file' -H '${AUTHORIZATION_HEADER%:*}: ...' -q -L '$1' -o '$2'" > "$last_curl_command"
+    return
+  fi
+  curl_error_code=$?
+  (
+    echo "## curl failed ($curl_error_code) accessing $1"
+    echo
+    echo '```'
+    cat "$curl_error" | perl -pe 's/(\d+)(curl: \(\d+\))/$1\n$2/' || true
+    echo
+    echo '```'
+  ) | tee -a "$GITHUB_STEP_SUMMARY" >&2
+  exit "$curl_error_code"
+}
+
+list_releases() {
+  releases_url_base="${GH_API_URL:-$GITHUB_API_URL}/repos/$repo/releases"
+  if [ -n "$version" ]; then
+    releases_url="$releases_url_base/tags/$version"
+  else
+    releases_url="$releases_url_base"
+  fi
+  curl_handle_error "$releases_url" "$releases"
+  response_code=$(get_response_code)
+  type=$(get_content_type "$headers_file")
+  if [ $response_code -eq 404 ]; then
+    if [ -n "$version" ]; then
+      curl_handle_error "$releases_url_base" "/dev/null"
+      releases_response_code=$(get_response_code)
+      if [ $releases_response_code -eq 404 ]; then
+        releases_is_404=1
+      fi
+    else
+      releases_is_404=1
+    fi
+    if [ -n "$releases_is_404" ]; then
+      if [ -n "$token_is_not_gh_token" ]; then
+        hint="If the repository $b $repo $b is private, then the provided $b token $b does not have access to the repository"
+      else
+        hint="If the repository $b $repo $b is private, then provide a $b token $b"
+      fi
+      hint="$hint. Otherwise, the repository either does not exist or has been deleted. Check with the repository owner for more information."
+    else
+      hint="The specified version $b $version $b of $b $repo $b is missing; either it never existed or it was deleted. Check the version and the releases page."
+    fi
+  fi
+  validate_response_code "$response_code" "$releases" "$releases_url"
+}
+
+find_artifact() {
+  if [ -z "$version" ]; then
+    version_selector='.[0]'
+  fi
+  if [ -z "$os_re" ]; then
+    os=$(echo "${os:-$(uname -s)}"|tr A-Z a-z)
+    case "$os" in
+      darwin)
+        os_re='[Dd]arwin|[Mm][Aa][Cc][Oo][Ss]'
+        ;;
+      linux)
+        os_re='[Ll]inux'
+        ;;
+      windows*|CYGWIN*)
+        os_re='[Ww]in(?:dows|)'
+        ;;
+    esac
+  fi
+  if [ -z "$arch_re" ]; then
+    arch=$(echo "${arch:-$(uname -m)}"|tr A-Z a-z)
+    case "$arch" in
+      arm64|aarch64)
+        arch_re='[Aa]rm64|[Aa]arch64';;
+      amd64|x86_64)
+        arch_re='[Aa]md64|[Xx]86[-_]64';;
+      i686|i386|x86)
+        arch_re='(?:i[3-6]|x)86';;
+    esac
+  fi
+  artifact=$(
+    os_re="$os_re" arch_re="$arch_re" version_selector="$version_selector" \
+  "$GITHUB_ACTION_PATH/program-filter" "$releases"
+  )
+}
+
+select_artifact() {
+  find_artifact
+  if [ -n "$artifact" ]; then
+    return
+  fi
+
+  q='`'
+  if [ -n "$os_re" ]; then
+    os_message="OS ($q$os_re$q)"
+    maybe_and=1
+    matching=1
+  fi
+  if [ -n "$arch_re" ]; then
+    arch_message="arch ($q$arch_re$q)"
+    if [ -n "$maybe_and" ]; then
+      and=' and '
+    fi
+    matching=1
+  fi
+  if [ -n "$matching" ]; then
+    matching='for a release matching '
+  fi
+  if [ -n "$version_selector" ]; then
+    version_selector_message=" using version selector: $q$version_selector$q"
+  fi
+  (
+    echo "## Asset not found in release"
+    echo
+    echo "Checked $releases_url ${matching}${os_message}${and}${arch_message}${version_selector_message}"
+    echo
+    echo '### curl command'
+    echo '```sh'
+    cat $last_curl_command || true
+    echo '```'
+    echo
+    echo '### http response'
+    echo
+    echo '```yaml'
+    cat "$headers_file" || true
+    echo '```'
+    echo
+    echo '### Release content'
+    echo
+    if tail -1c "$releases" | grep -q .; then
+      missing_newline_at_eof=1
+    fi
+    echo '```json'
+    cat "$releases"
+    if [ -n "$missing_newline_at_eof" ]; then
+      echo
+    fi
+    echo '```'
+    if [ -n "$missing_newline_at_eof" ]; then
+      echo '(missing-newline-at-eof)'
+    fi
+  ) | tee -a "$GITHUB_STEP_SUMMARY" >&2
+  exit 1
+}
+
+set_up_auth() {
+  if [ -n "$GH_TOKEN" ]; then
+    export AUTHORIZATION_HEADER="Authorization: token $GH_TOKEN"
+  else
+    export AUTHORIZATION_HEADER='X-No-Authorization: Sorry About That'
+  fi
+}
+
+get_header_value() {
+  perl -e '
+    my $headers_file=shift;
+    my $value;
+    {
+      open(my $headers, q(<), $headers_file);
+      local $/="\r\n";
+      while (<$headers>) {
+        chomp;
+        next unless m/^$ENV{header}:\s+(.*)$/i;
+        $value=$1;
+      }
+      close $headers;
+    }
+    print $value;
+  ' "$1"
+}
+
+get_content_length() {
+  header='content-length' get_header_value "$1"
+}
+
+get_content_type() {
+  header='content-type' get_header_value "$1"
+}
+
+validate_response_code() {
+  case "$1" in
+    200)
+      return
+      ;;
+    401)
+      title='Bad credentials'
+      if [ -z "$hint" ]; then
+        hint="Either the provided $b token $b was never valid for repository $b $repo $b, it was revoked/deleted, or it expired. Try replacing it."
+      fi
+      ;;
+    404)
+      title='Server reported resource not found'
+      ;;
+    500)
+      title='Server reported internal error'
+      ;;
+    *)
+      title='Unexpected http response code'
+      ;;
+  esac
+  (
+    echo "## $title ($b $1 $b)"
+    if [ -n "$hint" ]; then
+      echo "$hint"
+    fi
+    echo
+    echo "$b $3 $b:"
+    echo
+    case "$type" in
+      *json*)
+        type=json;;
+      *html*)
+        type=html;;
+      *)
+        type=''
+    esac
+    echo '```'"$type"
+    head -c 10240 "$2"
+    echo '```'
+  ) | tee -a "$GITHUB_STEP_SUMMARY" >&2
+  exit 1
+}
+
+validate_file_length() {
+  perl -e '
+    my $artifact=$ENV{artifact};
+    my $temp_file=$ENV{temp_file};
+    my $length=$ENV{content_length};
+    my $size=-s $temp_file;
+    die "downloaded artifact ($artifact) length ($size) is not expected length ($length)" unless ($size) == $length;
+    print "\n";
+  '
+}
+
+shasum() {
+  perl -e '
+  use Digest::SHA qw($errmsg);
+  my $mode = "b";
+  my $alg = 256;
+  my $file = shift;
+  my $digest = eval { Digest::SHA->new($alg)->addfile($file, $mode) };
+  if ($@) { warn "shasum: $file: $errmsg\n"; exit; }
+  print $digest->hexdigest;
+  ' "$1"
+}
+
+get_response_code() {
+  perl -e '$/="\r\n\r\n"; my $code = -1; while (<>) { $_ =~ s/\n.*/\n/s; next unless m!HTTP/\S+\s+(\d+)!; $code=$1;} print $code;' "$headers_file"
+}
+
+download_artifact() {
+  temp_file=$(mktemp)
+  curl_handle_error "$artifact" "$temp_file"
+  response_code=$(get_response_code)
+  content_length=$(get_content_length "$headers_file")
+  request_id=$(grep -i ^x-github-request-id: "$headers_file" | tail -1)
+  echo "Downloaded $artifact - status: $response_code; content-length: $content_length; shasum256: $(shasum "$temp_file"); $request_id"
+  validate_response_code "$response_code" "$temp_file" "$artifact"
+  content_length="$content_length" artifact="$artifact" temp_file="$temp_file" validate_file_length
+
+  echo "url=$artifact" >> "$GITHUB_OUTPUT"
+}
+
+select_file() {
+  list=$(mktemp)
+  cat - > "$list"
+  if [ ! -s "$list" ]; then
+    echo "No files in archive" >&2
+    false
+  fi
+  if [ -n "$file_re" ]; then
+    result=$(
+      grep -E "$file_re" "$list" | tail -1
+    )
+    rm -f "$list"
+    if [ -n "$result" ]; then
+      echo "$result"
+    else
+      echo "file_re ($file_re) did not match any files in archive" >&2
+      false
+    fi
+  else
+    tail -1 "$list"
+    rm -f "$list"
+  fi
+}
+
+strip_zip_file_size_date_and_time_from_directory_listing() {
+  perl -pe 's/^\s*\d+\s+\d+-\d+-\d+\s+\d+:\d+\s+//'
+}
+
+get_destination() {
+  destination="${destination:-$GITHUB_WORKSPACE}"
+  (
+    cd "$GITHUB_WORKSPACE"
+    mkdir -p "$(dirname "$destination")"
+  )
+  safe_destination=$(printf '%s' "$destination" | tr -d '\n\r')
+  echo "path=$safe_destination" >> "$GITHUB_OUTPUT"
+}
+
+move_and_cleanup_selected_file() {
+  get_destination
+  if [ -n "$selected_file" ] && [ -e "$selected_file" ]; then
+    selected_file="$(pwd)/$selected_file"
+    cd "$GITHUB_WORKSPACE"
+    mv "$selected_file" "$destination" &&
+    rm "$temp_file"
+  else
+    mkdir -p "$destination"
+    find . -mindepth 1 -maxdepth 1 -print0 |
+      xargs -0 mv -t "$destination"
+  fi
+}
+
+maybe_work_in_scratch_area() {
+  if [ -n "$selected_file" ]; then
+    cd "$(mktemp -d)"
+  fi
+}
+
+maybe_extract_artifact() {
+  case "$artifact" in
+  *.tar.gz|*.tgz)
+    selected_file=$(
+      tar tzf "$temp_file" |
+      select_file
+    )
+    maybe_work_in_scratch_area
+    tar zxf "$temp_file" "$selected_file"
+    move_and_cleanup_selected_file
+    ;;
+  *.zip)
+    selected_file=$(
+      unzip -l "$temp_file" |
+      select_file |
+      strip_zip_file_size_date_and_time_from_directory_listing
+    )
+    maybe_work_in_scratch_area
+    unzip "$temp_file" "$selected_file"
+    move_and_cleanup_selected_file
+    ;;
+  *)
+    : binary
+    get_destination
+    mv "$temp_file" "$destination"
+  esac
+  if [ -n "$destination" ] && [ -f "$destination" ]; then
+    chmod +x "$destination"
+    if [ -n "$add_to_path" ]; then
+      safe_path=$(realpath "$(dirname "$destination")" | tr -d '\n\r')
+      printf '%s\n' "$safe_path" >> "$GITHUB_PATH"
+    fi
+  fi
+}
+
+setup
+set_up_auth
+list_releases
+select_artifact
+download_artifact
+maybe_extract_artifact
