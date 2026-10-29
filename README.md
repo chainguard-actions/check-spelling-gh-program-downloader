@@ -6,9 +6,9 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 
 ## Versions
 
-| Version | Tag | Upstream commit |
-|---------|-----|-----------------|
-| v0.0.5 | [`v0.0.5`](https://github.com/chainguard-actions/check-spelling-gh-program-downloader/tree/v0.0.5) | [`87b3139`](https://github.com/check-spelling/gh-program-downloader/commit/87b313998f6b1072e6b7e51fd6627419f5102385) |
+| Version | Tag | Upstream commit | Hardening report |
+|---------|-----|-----------------|------------------|
+| v0.0.5 | [`v0.0.5`](https://github.com/chainguard-actions/check-spelling-gh-program-downloader/tree/v0.0.5) | [`87b3139`](https://github.com/check-spelling/gh-program-downloader/commit/87b313998f6b1072e6b7e51fd6627419f5102385) | [`HARDENING.md`](https://github.com/chainguard-actions/check-spelling-gh-program-downloader/blob/v0.0.5/HARDENING.md) |
 
 ## Privacy
 
